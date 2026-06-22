@@ -11,9 +11,10 @@ use ibapi::subscriptions::SubscriptionItem;
 
 use super::*;
 use crate::{
-    common::enums::{IbAction, IbOrderStatus},
+    common::enums::{IbAction, IbOrderStatus, IbOrderType},
     execution::parse,
 };
+use nautilus_model::enums::OrderType;
 
 impl InteractiveBrokersExecutionClient {
     /// Starts the order update subscription stream.
@@ -436,14 +437,47 @@ impl InteractiveBrokersExecutionClient {
             strategy_id_map,
         )?;
         let price_magnifier = instrument_provider.get_price_magnifier(&instrument_id) as f64;
-        let price = order_data
-            .order
-            .limit_price
-            .map(|price| Price::new(price * price_magnifier, instrument.price_precision()));
-        let trigger_price = order_data
-            .order
-            .aux_price
-            .map(|price| Price::new(price * price_magnifier, instrument.price_precision()));
+        // Gate pricing fields by order type so we never emit a priced/triggered
+        // OrderUpdated for an order type that rejects one. IB stamps a price-cap
+        // `limit_price` on option MARKET orders; copying it into OrderUpdated.price
+        // unconditionally made MarketOrder::update assert (`price.is_none()`) and
+        // panic the engine ("Invalid event for order type"). Mirror the rules the
+        // report path already enforces (parse_ib_order_pricing_fields) and issues
+        // #3672 / #3673: only price-bearing types carry a limit price, only
+        // conditional types carry a trigger; Market / MarketToLimit carry neither.
+        let nautilus_order_type = IbOrderType::from_str(&order_data.order.order_type)
+            .map_or(OrderType::Market, IbOrderType::nautilus_order_type);
+        let price = if matches!(
+            nautilus_order_type,
+            OrderType::Limit
+                | OrderType::StopLimit
+                | OrderType::LimitIfTouched
+                | OrderType::TrailingStopLimit
+                | OrderType::MarketToLimit
+        ) {
+            order_data
+                .order
+                .limit_price
+                .map(|price| Price::new(price * price_magnifier, instrument.price_precision()))
+        } else {
+            None
+        };
+        let trigger_price = if matches!(
+            nautilus_order_type,
+            OrderType::StopMarket
+                | OrderType::StopLimit
+                | OrderType::MarketIfTouched
+                | OrderType::LimitIfTouched
+                | OrderType::TrailingStopMarket
+                | OrderType::TrailingStopLimit
+        ) {
+            order_data
+                .order
+                .aux_price
+                .map(|price| Price::new(price * price_magnifier, instrument.price_precision()))
+        } else {
+            None
+        };
         let quantity = Quantity::new(order_data.order.total_quantity, instrument.size_precision());
         let venue_order_id =
             parse::ib_venue_order_id(order_data.order_id, order_data.order.perm_id);
