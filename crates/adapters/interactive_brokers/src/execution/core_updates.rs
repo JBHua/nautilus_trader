@@ -202,24 +202,13 @@ impl InteractiveBrokersExecutionClient {
                 .await?;
             }
             OrderUpdate::ExecutionData(exec_data) => {
-                let execution_id = exec_data.execution.execution_id.clone();
-                let has_commission = commission_cache
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Failed to lock commission cache"))?
-                    .contains_key(&execution_id);
-
-                if !has_commission {
-                    tracing::debug!(
-                        "Buffering execution data {} until commission report arrives",
-                        execution_id
-                    );
-                    pending_live_exec_data
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("Failed to lock pending live execution data"))?
-                        .insert(execution_id, exec_data.clone());
-                    return Ok(());
-                }
-
+                // PATCH(0002): do NOT buffer the fill awaiting a CommissionReport.
+                // The IBKR PAPER gateway frequently never sends one, which left the
+                // execution buffered forever and OrderFilled never emitted (orders
+                // that filled at IB showed as "stuck OPEN" to the runner). Emit the
+                // fill now; `handle_execution_data` defaults a missing commission to
+                // zero. `pending_live_exec_data` stays referenced by the
+                // CommissionReport + order-status paths, so no unused-binding churn.
                 Self::handle_execution_data(
                     exec_data,
                     order_id_map,
@@ -849,16 +838,15 @@ impl InteractiveBrokersExecutionClient {
             let mut cache = commission_cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Failed to lock commission cache"))?;
-            let Some((commission, commission_currency)) =
-                cache.remove(&exec_data.execution.execution_id)
-            else {
-                tracing::debug!(
-                    "Execution data {} is waiting for commission report",
-                    exec_data.execution.execution_id
-                );
-                return Ok(());
-            };
-            (commission, commission_currency)
+            // PATCH(0002): default a missing commission to zero instead of
+            // returning. The IBKR PAPER gateway frequently never sends a
+            // CommissionReport; gating the fill on it dropped the fill entirely.
+            // Paper has no commissions, so zero is correct; a live account would
+            // carry zero commission on the fill until a future timeout-based
+            // backfill — acceptable for the paper runners this fork serves.
+            cache
+                .remove(&exec_data.execution.execution_id)
+                .unwrap_or_else(|| (0.0, "USD".to_string()))
         };
 
         let is_bag = matches!(
