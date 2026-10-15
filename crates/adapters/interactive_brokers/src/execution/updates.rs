@@ -1069,22 +1069,12 @@ impl InteractiveBrokersExecutionClient {
                     average_price = exec_data.execution.average_price,
                     "Received IB execDetails",
                 );
-                // IB sends no commissionReport for the combo execution of a spread, its
-                // commission arrives on the leg executions
-                let has_commission = parse::is_combo_execution(exec_data)
-                    || commission_cache.lock().contains_key(&execution_id);
-
-                if !has_commission {
-                    tracing::debug!(
-                        "Buffering execution data {} until commission report arrives",
-                        execution_id
-                    );
-                    pending_live_exec_data.lock().insert(
-                        execution_id,
-                        (tokio::time::Instant::now(), exec_data.clone()),
-                    );
-                    return Ok(());
-                }
+                // PATCH(0002): do NOT buffer the fill awaiting a CommissionReport.
+                // The IBKR PAPER gateway frequently never sends one; upstream's 5s
+                // COMMISSION_REPORT_TIMEOUT flush would still deliver OrderFilled
+                // ~5-6s late, AFTER an IOC's immediate OrderCanceled, so a strategy
+                // sizing a residual from filled_qty at cancel time oversells. Emit
+                // now; `handle_execution_data` defaults a missing commission to zero.
 
                 Self::handle_execution_data(
                     exec_data,
@@ -1795,19 +1785,19 @@ impl InteractiveBrokersExecutionClient {
         let (commission, commission_currency) = if parse::is_combo_execution(exec_data) {
             (0.0, exec_data.contract.currency.to_string())
         } else {
-            let mut cache = commission_cache.lock();
-
-            let Some((commission, commission_currency)) =
-                cache.remove(&exec_data.execution.execution_id)
-            else {
-                tracing::debug!(
-                    "Execution data {} is waiting for commission report",
-                    exec_data.execution.execution_id
+            // PATCH(0002): default a missing commission to zero instead of
+            // returning (paper never sends the report). A late CommissionReport
+            // only updates the cache; the fill is already out, no double-emit.
+            let cached = commission_cache
+                .lock()
+                .remove(&exec_data.execution.execution_id);
+            cached.unwrap_or_else(|| {
+                let currency = instrument_provider.find(&instrument_id).map_or_else(
+                    || exec_data.contract.currency.to_string(),
+                    |instrument| instrument.quote_currency().code.to_string(),
                 );
-                return Ok(());
-            };
-
-            (commission, commission_currency)
+                (0.0, currency)
+            })
         };
 
         record_own_fill(
